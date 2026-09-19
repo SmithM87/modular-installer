@@ -20,6 +20,28 @@ powershell -ExecutionPolicy Bypass -File .\Install-Software.ps1
 If the script isn't running as administrator (or isn't in STA mode, which WPF needs), it restarts itself
 with a UAC prompt. Run it from a saved `.ps1` file, not pasted into a console, so it can do that.
 
+## Double-click .exe
+
+Build a standalone `ModularInstaller.exe` that you can double-click, pin to the taskbar or copy anywhere:
+
+```powershell
+powershell -ExecutionPolicy Bypass -File .\Build-Exe.ps1
+```
+
+The result is `dist\ModularInstaller.exe` (about 50 KB). Nothing is downloaded or installed to build it: the
+script uses the C# compiler (`csc.exe`) that ships with Windows.
+
+- **One file:** the script is embedded inside the exe, so it runs without the `.ps1` next to it.
+- **Admin:** the exe's manifest requests Administrator rights, so Windows shows the UAC prompt on launch.
+- **No console window:** only the installer window appears.
+- **Rebuild after edits:** the script is embedded at build time, so run the build again after changing
+  `Install-Software.ps1` (for example the `$Apps` catalog).
+- **Dry run:** `ModularInstaller.exe -DryRun` simulates winget, like the script's switch. Build with
+  `-NoElevate` if you want a test exe that doesn't prompt for admin (`.\Build-Exe.ps1 -NoElevate -OutFile test.exe`).
+- **SmartScreen:** the exe is unsigned, so Windows may show "unknown publisher" on the first run. Some antivirus
+  products are also wary of unsigned custom executables; building it yourself from this source is the safeguard.
+- The exe needs Windows PowerShell 5.1 (built into Windows 10/11).
+
 ## System updates
 
 | Button             | What it runs                                                                                  |

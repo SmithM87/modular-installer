@@ -1,3 +1,5 @@
 # Keep Windows line endings for scripts regardless of contributor git settings
 *.ps1 text eol=crlf
 *.md  text
+*.cs  text
+*.manifest text

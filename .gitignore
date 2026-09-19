@@ -1,3 +1,6 @@
+# Build output (regenerate with Build-Exe.ps1)
+dist/
+
 # Logs and scratch files
 *.log
 *.tmp
