@@ -1,3 +1,4 @@
+<img width="1108" height="772" alt="image" src="https://github.com/user-attachments/assets/bdde6a5b-4227-4180-9071-be4fa7ce8ac6" />
 # modular-installer
 
 A single-file PowerShell script with a dark-themed WPF GUI that installs software through
