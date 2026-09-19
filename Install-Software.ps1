@@ -1,6 +1,6 @@
 <#
 .SYNOPSIS
-    Modular, dark-themed WPF software installer built on winget.
+    Modular, dark-themed WPF software installer and system updater built on winget.
 
 .DESCRIPTION
     Single-file script. On launch it:
@@ -9,6 +9,8 @@
       3. Installs the selected apps through `winget` on a background Runspace, streaming
          winget's output line by line into an embedded log pane. The UI thread never blocks:
          the worker only enqueues text; a DispatcherTimer on the UI thread drains the queue.
+      4. Offers system-update buttons that use the same pipeline: update all apps
+         (`winget upgrade --all`), Windows + driver updates (PSWindowsUpdate), or both.
 
     To add software, add a line to $Apps (Category, Name, WingetId, PreChecked).
 
@@ -82,7 +84,7 @@ if ((-not $isAdmin -and -not $DryRun) -or -not $isSta) {
 #   $Queue - ConcurrentQueue of { Text, Level } log entries the UI drains
 #   $State - synchronized hashtable with progress counters and the Cancel flag
 $Worker = {
-    param($Apps, $State, $Queue, $DryRun)
+    param($Jobs, $State, $Queue)
 
     function Send-Log([string]$Text, [string]$Level = 'info') {
         $Queue.Enqueue([pscustomobject]@{ Text = $Text; Level = $Level })
@@ -93,46 +95,33 @@ $Worker = {
     # line by line that becomes hundreds of junk lines, so drop them.
     # (Block characters are built from code points to keep this file pure ASCII, which Windows PowerShell 5.1 needs.)
     $blocks = -join ([char[]](0x2588, 0x2593, 0x2592, 0x2591))
-    $noise  = [regex]('^\s*$|^\s*[-\\|/]\s*$|[' + $blocks + ']|^\s*\d+(\.\d+)?\s*[KMG]?i?B\s*/\s*\d+(\.\d+)?\s*[KMG]?i?B\s*$')
+    # Also drop the CLIXML progress envelope a child powershell.exe can emit when its output is redirected.
+    $noise  = [regex]('^\s*$|^\s*[-\\|/]\s*$|[' + $blocks + ']|^\s*\d+(\.\d+)?\s*[KMG]?i?B\s*/\s*\d+(\.\d+)?\s*[KMG]?i?B\s*$|^#< CLIXML|^<Objs ')
 
-    $total = @($Apps).Count
+    $total = @($Jobs).Count
     $index = 0
 
     try {
-        foreach ($app in $Apps) {
+        foreach ($job in $Jobs) {
             $index++
 
             if ($State.Cancel) {
-                Send-Log ("[{0}] Skipped {1} (cancelled)" -f (Get-Stamp), $app.Name) 'warn'
+                Send-Log ("[{0}] Skipped {1} (cancelled)" -f (Get-Stamp), $job.Name) 'warn'
                 $State.Skipped++
                 continue
             }
 
-            $State.Current = "Installing $($app.Name) ($index of $total)"
+            $State.Current = "$($job.Action) $($job.Name) ($index of $total)"
             Send-Log '' 'info'
-            Send-Log ("[{0}] ({1}/{2}) Installing {3}" -f (Get-Stamp), $index, $total, $app.Name) 'head'
+            Send-Log ("[{0}] ({1}/{2}) {3} {4}" -f (Get-Stamp), $index, $total, $job.Action, $job.Name) 'head'
 
-            # The id ends up on a command line, so accept only characters valid in winget ids.
-            if ($app.Id -notmatch '^[A-Za-z0-9][A-Za-z0-9._+\-]*$') {
-                Send-Log "Invalid winget id '$($app.Id)'. Skipping." 'err'
+            # A job without a command was rejected while it was being built (see New-InstallJob).
+            if (-not $job.Command) {
+                Send-Log $job.Error 'err'
                 $State.Failed++; $State.Completed++
                 continue
             }
-
-            $wingetArgs = "install --exact --id $($app.Id) --silent --accept-package-agreements --accept-source-agreements"
-            Send-Log "> winget $wingetArgs" 'cmd'
-
-            if ($DryRun) {
-                # Fake winget: a few lines with a spinner and delays. Ids ending in ".Fail" simulate an error.
-                $inner = "echo Found $($app.Name) [$($app.Id)] Version 1.0.0 & ping -n 2 127.0.0.1 >nul" +
-                         " & echo Downloading https://example.invalid/$($app.Id) & echo   - & ping -n 2 127.0.0.1 >nul & echo   \" +
-                         " & echo Successfully verified installer hash & echo Starting package install... & ping -n 2 127.0.0.1 >nul"
-                if ($app.Id -like '*.Fail') { $inner += ' & echo Simulated failure & exit /b 1' }
-                else                        { $inner += ' & echo Successfully installed' }
-            }
-            else {
-                $inner = "winget $wingetArgs"
-            }
+            Send-Log "> $($job.Display)" 'cmd'
 
             $exit = $null
             try {
@@ -140,7 +129,7 @@ $Worker = {
                 # on a single pipe that we can read line by line.
                 $psi = New-Object System.Diagnostics.ProcessStartInfo
                 $psi.FileName               = $env:ComSpec
-                $psi.Arguments              = "/d /c $inner 2>&1"
+                $psi.Arguments              = "/d /c $($job.Command) 2>&1"
                 $psi.UseShellExecute        = $false
                 $psi.CreateNoWindow         = $true
                 $psi.RedirectStandardOutput = $true
@@ -179,11 +168,11 @@ $Worker = {
             # winget exit codes: https://github.com/microsoft/winget-cli/blob/master/doc/windows/package-manager/winget/returnCodes.md
             $stamp = Get-Stamp
             switch ($exit) {
-                0            { Send-Log "[$stamp] OK: $($app.Name) installed."                              'ok';   $State.Succeeded++ }
-                -1978335135  { Send-Log "[$stamp] OK: $($app.Name) is already installed."                    'ok';   $State.Succeeded++ }
-                -1978335189  { Send-Log "[$stamp] OK: $($app.Name) is already up to date."                   'ok';   $State.Succeeded++ }
-                3010         { Send-Log "[$stamp] OK: $($app.Name) installed. A restart is required."        'warn'; $State.Succeeded++ }
-                default      { Send-Log "[$stamp] FAILED: $($app.Name) (exit code $exit)."                    'err';  $State.Failed++ }
+                0            { Send-Log "[$stamp] OK: $($job.Name) $($job.Past)."                            'ok';   $State.Succeeded++ }
+                -1978335135  { Send-Log "[$stamp] OK: $($job.Name) - already installed."                     'ok';   $State.Succeeded++ }
+                -1978335189  { Send-Log "[$stamp] OK: $($job.Name) - no applicable updates."                 'ok';   $State.Succeeded++ }
+                3010         { Send-Log "[$stamp] OK: $($job.Name) $($job.Past). A restart is required."     'warn'; $State.Succeeded++ }
+                default      { Send-Log "[$stamp] FAILED: $($job.Name) (exit code $exit)."                    'err';  $State.Failed++ }
             }
             $State.Completed++
         }
@@ -199,12 +188,115 @@ $Worker = {
 }
 
 # ============================================================================================
+#  3b. JOB DEFINITIONS  -  what the worker can run
+# ============================================================================================
+# A job is a plain object: Name/Action/Past build the log wording ("Updating <Name>" ... "<Name> <Past>"),
+# Display is the command shown in the log, Command is the cmd.exe command line the worker executes, and
+# Command is $null (with Error set) when the job was rejected. In -DryRun mode Command is a harmless fake.
+$FakeDelay = 'ping -n 2 127.0.0.1 >nul'      # cmd has no sleep; a 2-ping run is a portable ~1 second pause
+
+function New-Job([string]$Name, [string]$Action, [string]$Past, [string]$Display, [string]$Command, [bool]$NeedsWinget) {
+    [pscustomobject]@{ Name = $Name; Action = $Action; Past = $Past; Display = $Display
+                       Command = $Command; Error = $null; NeedsWinget = $NeedsWinget }
+}
+
+# Install one catalog app: winget install --exact --id <Id> ...
+function New-InstallJob($App) {
+    $wingetArgs = "install --exact --id $($App.Id) --silent --accept-package-agreements --accept-source-agreements"
+    $job = New-Job $App.Name 'Installing' 'installed' "winget $wingetArgs" $null $true
+
+    # The id ends up on a command line, so accept only characters valid in winget ids.
+    if ($App.Id -notmatch '^[A-Za-z0-9][A-Za-z0-9._+\-]*$') {
+        $job.Error = "Invalid winget id '$($App.Id)'. Skipping."
+        return $job
+    }
+
+    if ($DryRun) {
+        # Fake winget: a few lines with a spinner and delays. Ids ending in ".Fail" simulate an error.
+        $fake = "echo Found $($App.Name) [$($App.Id)] Version 1.0.0 & $FakeDelay" +
+                " & echo Downloading https://example.invalid/$($App.Id) & echo   - & $FakeDelay & echo   \" +
+                " & echo Successfully verified installer hash & echo Starting package install... & $FakeDelay"
+        if ($App.Id -like '*.Fail') { $fake += ' & echo Simulated failure & exit /b 1' }
+        else                        { $fake += ' & echo Successfully installed' }
+        $job.Command = $fake
+    }
+    else {
+        $job.Command = "winget $wingetArgs"
+    }
+    $job
+}
+
+# Upgrade every installed package winget knows about (including ones with an unknown version).
+function New-WingetUpgradeJob {
+    $wingetArgs = 'upgrade --all --include-unknown --silent --accept-package-agreements --accept-source-agreements'
+    $job = New-Job 'installed applications' 'Updating' 'updated' "winget $wingetArgs" $null $true
+
+    if ($DryRun) {
+        $job.Command = "echo Name Id Version Available & echo Fake App Fake.App 1.0 2.0 & $FakeDelay" +
+                       " & echo Found Fake App [Fake.App] Version 2.0 & echo Downloading https://example.invalid/Fake.App & $FakeDelay" +
+                       " & echo Successfully installed & echo 1 package updated"
+    }
+    else {
+        $job.Command = "winget $wingetArgs"
+    }
+    $job
+}
+
+# Windows Update + driver patches through the PSWindowsUpdate module. The module is fetched from the
+# PowerShell Gallery on first use. Restarts are never forced: the job only reports that one is pending.
+function New-WindowsUpdateJob {
+    $job = New-Job 'Windows Update' 'Running' 'finished' `
+        'powershell Get-WindowsUpdate -MicrosoftUpdate -Install -AcceptAll -IgnoreReboot   (PSWindowsUpdate module)' $null $false
+
+    if ($DryRun) {
+        $job.Command = "echo [+] Checking for Windows and driver updates & $FakeDelay" +
+                       " & echo   Downloaded  KB5000001  120 MB  Fake Cumulative Update & $FakeDelay" +
+                       " & echo   Installed   KB5000001  120 MB  Fake Cumulative Update & $FakeDelay" +
+                       " & echo WARNING: A restart is required to finish some updates. Reboot when convenient."
+        return $job
+    }
+
+    # Runs in a child Windows PowerShell 5.1 (PSWindowsUpdate targets it). Passed as -EncodedCommand so no
+    # quoting survives cmd.exe, and with $ProgressPreference silenced so no progress records pollute the pipe.
+    $child = @'
+$ErrorActionPreference = 'Stop'
+$ProgressPreference    = 'SilentlyContinue'
+[Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+try {
+    [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
+    if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
+        Write-Host '[+] Installing PSWindowsUpdate module from the PowerShell Gallery...'
+        Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
+        Install-Module PSWindowsUpdate -Force -Confirm:$false -Scope CurrentUser
+    }
+    Import-Module PSWindowsUpdate
+    Write-Host '[+] Checking for Windows and driver updates (this can take several minutes)...'
+    $count = 0
+    Get-WindowsUpdate -MicrosoftUpdate -Install -AcceptAll -IgnoreReboot | ForEach-Object {
+        $count++
+        $state = if ($_.Result) { $_.Result } else { $_.Status }
+        Write-Host ('  {0,-11} {1,-10} {2,-9} {3}' -f $state, $_.KB, $_.Size, $_.Title)
+    }
+    if ($count -eq 0) { Write-Host 'No Windows or driver updates are available.' }
+    if (Get-WURebootStatus -Silent) { Write-Host 'WARNING: A restart is required to finish some updates. Reboot when convenient.' }
+}
+catch {
+    Write-Host "ERROR: $($_.Exception.Message)"
+    exit 1
+}
+'@
+    $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
+    $job.Command = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand $encoded"
+    $job
+}
+
+# ============================================================================================
 #  4. XAML  -  dark theme, custom control templates, layout
 # ============================================================================================
 $Xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Software Installer" Width="1100" Height="700" MinWidth="820" MinHeight="520"
+        Title="Software Installer" Width="1100" Height="780" MinWidth="820" MinHeight="600"
         WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" UseLayoutRounding="True"
         Background="#18181C">
     <Window.Resources>
@@ -392,8 +484,23 @@ $Xaml = @'
                         </Grid.ColumnDefinitions>
                         <Button x:Name="BtnInstall" Grid.Column="0" Content="Install Selected" Style="{StaticResource AccentButton}"/>
                         <Button x:Name="BtnCancel"  Grid.Column="1" Content="Cancel" Margin="8,0,0,0" Padding="16,11" Visibility="Collapsed"
-                                ToolTip="Skip the remaining apps after the current install finishes"/>
+                                ToolTip="Skip the remaining tasks after the current one finishes"/>
                     </Grid>
+
+                    <Border Height="1" Background="{StaticResource BorderBrush}" Margin="0,16,0,14"/>
+                    <TextBlock Text="SYSTEM UPDATES" FontSize="11.5" FontWeight="SemiBold" Margin="2,0,0,8"
+                               Foreground="{StaticResource MutedBrush}"/>
+                    <Grid Margin="0,0,0,8">
+                        <Grid.ColumnDefinitions>
+                            <ColumnDefinition Width="*"/><ColumnDefinition Width="8"/><ColumnDefinition Width="*"/>
+                        </Grid.ColumnDefinitions>
+                        <Button x:Name="BtnUpdateApps" Grid.Column="0" Content="Update Apps"
+                                ToolTip="winget upgrade --all: update every installed application"/>
+                        <Button x:Name="BtnUpdateWin"  Grid.Column="2" Content="Windows Update"
+                                ToolTip="Install Windows and driver updates (PSWindowsUpdate). Never forces a restart."/>
+                    </Grid>
+                    <Button x:Name="BtnUpdateAll" Content="Run All Updates"
+                            ToolTip="Update apps, then Windows and drivers"/>
                 </StackPanel>
             </Grid>
         </Border>
@@ -444,6 +551,9 @@ try {
     $BtnInstall   = $Window.FindName('BtnInstall')
     $BtnCancel    = $Window.FindName('BtnCancel')
     $BtnClear     = $Window.FindName('BtnClear')
+    $BtnUpdateApps = $Window.FindName('BtnUpdateApps')
+    $BtnUpdateWin  = $Window.FindName('BtnUpdateWin')
+    $BtnUpdateAll  = $Window.FindName('BtnUpdateAll')
     $LogBox       = $Window.FindName('LogBox')
     $StatusText   = $Window.FindName('StatusText')
     $Progress     = $Window.FindName('Progress')
@@ -564,6 +674,7 @@ try {
         $AppList.IsEnabled      = -not $IsRunning
         $BtnSelectAll.IsEnabled = -not $IsRunning
         $BtnDeselect.IsEnabled  = -not $IsRunning
+        foreach ($b in $BtnUpdateApps, $BtnUpdateWin, $BtnUpdateAll) { $b.IsEnabled = -not $IsRunning }
         $BtnCancel.Visibility   = if ($IsRunning) { 'Visible' } else { 'Collapsed' }
         $BtnCancel.IsEnabled    = $true
         Update-SelectionCount
@@ -577,17 +688,19 @@ try {
         }
     }
 
-    function Start-Install {
-        $selected = @($Checkboxes | Where-Object { $_.IsChecked } | ForEach-Object { $_.Tag })
-        if ($selected.Count -eq 0) { return }
+    # Runs a list of jobs (see section 3b) on the background runspace, one after another.
+    function Start-JobQueue($Jobs) {
+        $Jobs = @($Jobs)
+        if ($Jobs.Count -eq 0) { return }
 
-        if (-not $DryRun -and -not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+        if (-not $DryRun -and @($Jobs | Where-Object { $_.NeedsWinget }).Count -gt 0 -and
+            -not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
             Add-LogLine 'winget was not found. Install "App Installer" from the Microsoft Store and try again.' 'err'
             return
         }
 
         $script:State = [hashtable]::Synchronized(@{
-            Cancel = $false; Total = $selected.Count; Completed = 0
+            Cancel = $false; Total = $Jobs.Count; Completed = 0
             Succeeded = 0; Failed = 0; Skipped = 0
             Current = 'Starting...'; Summary = ''; Process = $null
         })
@@ -601,9 +714,9 @@ try {
         $script:Ps = [powershell]::Create()
         $script:Ps.Runspace = $script:Rs
         [void]$script:Ps.AddScript($Worker.ToString()).
-            AddArgument($selected).AddArgument($script:State).AddArgument($Queue).AddArgument([bool]$DryRun)
+            AddArgument($Jobs).AddArgument($script:State).AddArgument($Queue)
 
-        $Progress.Maximum = $selected.Count
+        $Progress.Maximum = $Jobs.Count
         $Progress.Value   = 0
         Set-UiRunning $true
         $Timer.Start()
@@ -636,12 +749,38 @@ try {
     $BtnDeselect.Add_Click({  foreach ($c in $Checkboxes) { $c.IsChecked = $false } })
     $BtnClear.Add_Click({     $LogPara.Inlines.Clear() })
     $BtnInstall.Add_Click({
-        try { Start-Install } catch { Add-LogLine "Could not start: $($_.Exception.Message)" 'err'; Set-UiRunning $false }
+        try {
+            Start-JobQueue @($Checkboxes | Where-Object { $_.IsChecked } | ForEach-Object { New-InstallJob $_.Tag })
+        }
+        catch { Add-LogLine "Could not start: $($_.Exception.Message)" 'err'; Set-UiRunning $false }
     })
+
+    # Windows Update changes the whole system, so ask first (skipped in -DryRun).
+    function Confirm-WindowsUpdate {
+        if ($DryRun) { return $true }
+        $answer = [System.Windows.MessageBox]::Show($Window,
+            "This installs all available Windows and driver updates. If it is missing, the PSWindowsUpdate module is downloaded from the PowerShell Gallery first. A restart is never forced.`n`nContinue?",
+            'Windows Update', 'YesNo', 'Question')
+        $answer -eq 'Yes'
+    }
+
+    $BtnUpdateApps.Add_Click({
+        try { Start-JobQueue @(New-WingetUpgradeJob) }
+        catch { Add-LogLine "Could not start: $($_.Exception.Message)" 'err'; Set-UiRunning $false }
+    })
+    $BtnUpdateWin.Add_Click({
+        try { if (Confirm-WindowsUpdate) { Start-JobQueue @(New-WindowsUpdateJob) } }
+        catch { Add-LogLine "Could not start: $($_.Exception.Message)" 'err'; Set-UiRunning $false }
+    })
+    $BtnUpdateAll.Add_Click({
+        try { if (Confirm-WindowsUpdate) { Start-JobQueue @((New-WingetUpgradeJob), (New-WindowsUpdateJob)) } }
+        catch { Add-LogLine "Could not start: $($_.Exception.Message)" 'err'; Set-UiRunning $false }
+    })
+
     $BtnCancel.Add_Click({
         $State.Cancel = $true
         $BtnCancel.IsEnabled = $false
-        Add-LogLine 'Cancel requested. The current install will finish; remaining apps are skipped.' 'warn'
+        Add-LogLine 'Cancel requested. The current task will finish; remaining tasks are skipped.' 'warn'
     })
 
     $Window.Add_Closing({
