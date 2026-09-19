@@ -31,10 +31,17 @@ param(
 #  1. APPLICATION CATALOG  -  edit this list to change what the installer offers
 # ============================================================================================
 $Apps = @(
-    @{ Category = 'Utilities'; Name = '7-Zip';            WingetId = '7zip.7zip';                  PreChecked = $true  }
-    @{ Category = 'Utilities'; Name = 'Notepad++';        WingetId = 'Notepad++.Notepad++';        PreChecked = $true  }
-    @{ Category = 'Dev Tools'; Name = 'Git';              WingetId = 'Git.Git';                    PreChecked = $false }
-    @{ Category = 'Dev Tools'; Name = 'Windows Terminal'; WingetId = 'Microsoft.WindowsTerminal';  PreChecked = $false }
+    @{ Category = 'Runtimes & Frameworks'; Name = 'Visual C++ Runtimes All-In-One'; WingetId = 'abbodi1406.vcredist';                PreChecked = $true  }
+    @{ Category = 'Runtimes & Frameworks'; Name = '.NET 8 Desktop Runtime';         WingetId = 'Microsoft.DotNet.DesktopRuntime.8'; PreChecked = $true  }
+
+    @{ Category = 'System Utilities';      Name = '7-Zip';                          WingetId = '7zip.7zip';                         PreChecked = $true  }
+    @{ Category = 'System Utilities';      Name = 'Notepad++';                      WingetId = 'Notepad++.Notepad++';               PreChecked = $true  }
+    @{ Category = 'System Utilities';      Name = 'Microsoft PowerToys';            WingetId = 'Microsoft.PowerToys';               PreChecked = $false }
+
+    @{ Category = 'Dev & Engineering';     Name = 'Git';                            WingetId = 'Git.Git';                           PreChecked = $true  }
+    @{ Category = 'Dev & Engineering';     Name = 'VS Code';                        WingetId = 'Microsoft.VisualStudioCode';        PreChecked = $true  }
+    @{ Category = 'Dev & Engineering';     Name = 'Windows Terminal';               WingetId = 'Microsoft.WindowsTerminal';         PreChecked = $false }
+    @{ Category = 'Dev & Engineering';     Name = 'Sysinternals Suite';             WingetId = 'Microsoft.Sysinternals.Suite';      PreChecked = $false }
 )
 
 # ============================================================================================
@@ -296,7 +303,7 @@ catch {
 $Xaml = @'
 <Window xmlns="http://schemas.microsoft.com/winfx/2006/xaml/presentation"
         xmlns:x="http://schemas.microsoft.com/winfx/2006/xaml"
-        Title="Software Installer" Width="1100" Height="780" MinWidth="820" MinHeight="600"
+        Title="Software Installer" Width="1140" Height="830" MinWidth="860" MinHeight="600"
         WindowStartupLocation="CenterScreen" FontFamily="Segoe UI" UseLayoutRounding="True"
         Background="#18181C">
     <Window.Resources>
@@ -401,15 +408,19 @@ $Xaml = @'
                 <Setter.Value>
                     <ControlTemplate TargetType="CheckBox">
                         <Border x:Name="Row" Background="Transparent" CornerRadius="6" Padding="8,7">
-                            <StackPanel Orientation="Horizontal">
+                            <Grid>
+                                <Grid.ColumnDefinitions>
+                                    <ColumnDefinition Width="Auto"/>
+                                    <ColumnDefinition Width="*"/>
+                                </Grid.ColumnDefinitions>
                                 <Border x:Name="Box" Width="18" Height="18" CornerRadius="4" VerticalAlignment="Center"
                                         Background="{StaticResource SurfaceBrush}" BorderBrush="#5A5A68" BorderThickness="1.5">
                                     <Path x:Name="Check" Data="M3,7.5 L6,10.5 L12,4.5" Stroke="White" StrokeThickness="2"
                                           StrokeStartLineCap="Round" StrokeEndLineCap="Round" StrokeLineJoin="Round"
                                           Visibility="Collapsed"/>
                                 </Border>
-                                <ContentPresenter Margin="10,0,0,0" VerticalAlignment="Center"/>
-                            </StackPanel>
+                                <ContentPresenter Grid.Column="1" Margin="10,0,0,0" VerticalAlignment="Center"/>
+                            </Grid>
                         </Border>
                         <ControlTemplate.Triggers>
                             <Trigger Property="IsMouseOver" Value="True"><Setter TargetName="Row" Property="Background" Value="#2C2C35"/></Trigger>
@@ -445,7 +456,7 @@ $Xaml = @'
 
     <Grid Margin="16">
         <Grid.ColumnDefinitions>
-            <ColumnDefinition Width="360" MinWidth="300"/>
+            <ColumnDefinition Width="400" MinWidth="320"/>
             <ColumnDefinition Width="16"/>
             <ColumnDefinition Width="*"/>
         </Grid.ColumnDefinitions>
@@ -561,6 +572,9 @@ try {
     $TextBrush  = $Window.FindResource('TextBrush')
     $MutedBrush = $Window.FindResource('MutedBrush')
 
+    # Don't open taller than the screen's usable area (small laptop displays).
+    $Window.Height = [Math]::Min($Window.Height, [System.Windows.SystemParameters]::WorkArea.Height - 16)
+
     $Window.Title = 'Software Installer' + $(if ($isAdmin) { ' (Administrator)' } elseif ($DryRun) { ' (dry run)' } else { '' })
 
     # Dark title bar on Windows 10 20H1+/11 (silently ignored where unsupported).
@@ -637,8 +651,14 @@ try {
         $firstGroup = $false
 
         foreach ($app in $group.Group) {
-            $label = [System.Windows.Controls.StackPanel]::new()
-            $label.Orientation = 'Horizontal'
+            # Label = name (auto width) + winget id (takes the remaining width, ellipsized when it doesn't fit).
+            $label = [System.Windows.Controls.Grid]::new()
+            $colName = [System.Windows.Controls.ColumnDefinition]::new()
+            $colName.Width = [System.Windows.GridLength]::Auto
+            $colId = [System.Windows.Controls.ColumnDefinition]::new()
+            $colId.Width = [System.Windows.GridLength]::new(1, [System.Windows.GridUnitType]::Star)
+            $label.ColumnDefinitions.Add($colName)
+            $label.ColumnDefinitions.Add($colId)
 
             $name = [System.Windows.Controls.TextBlock]::new()
             $name.Text = $app.Name
@@ -650,11 +670,14 @@ try {
             $id.Text = $app.WingetId
             $id.FontSize = 11
             $id.Foreground = $MutedBrush
+            $id.TextTrimming = [System.Windows.TextTrimming]::CharacterEllipsis
             $id.Margin = [System.Windows.Thickness]::new(8, 2, 0, 0)
             $id.VerticalAlignment = 'Center'
+            [System.Windows.Controls.Grid]::SetColumn($id, 1)
             [void]$label.Children.Add($id)
 
             $cb = [System.Windows.Controls.CheckBox]::new()
+            $cb.ToolTip   = $app.WingetId
             $cb.Content   = $label
             $cb.IsChecked = [bool]$app.PreChecked
             $cb.Tag       = [pscustomobject]@{ Name = $app.Name; Id = $app.WingetId }
