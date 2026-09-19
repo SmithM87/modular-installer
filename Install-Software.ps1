@@ -42,6 +42,25 @@ $Apps = @(
     @{ Category = 'Dev & Engineering';     Name = 'VS Code';                        WingetId = 'Microsoft.VisualStudioCode';        PreChecked = $true  }
     @{ Category = 'Dev & Engineering';     Name = 'Windows Terminal';               WingetId = 'Microsoft.WindowsTerminal';         PreChecked = $false }
     @{ Category = 'Dev & Engineering';     Name = 'Sysinternals Suite';             WingetId = 'Microsoft.Sysinternals.Suite';      PreChecked = $false }
+
+    @{ Category = 'Lab, Virtualization & Network Operations'; Name = 'Oracle VirtualBox'; WingetId = 'Oracle.VirtualBox';     PreChecked = $false }
+    @{ Category = 'Lab, Virtualization & Network Operations'; Name = 'Vagrant';           WingetId = 'Hashicorp.Vagrant';     PreChecked = $false }
+    @{ Category = 'Lab, Virtualization & Network Operations'; Name = 'Nmap';              WingetId = 'Insecure.Nmap';         PreChecked = $false }
+    @{ Category = 'Lab, Virtualization & Network Operations'; Name = 'WinSCP';            WingetId = 'WinSCP.WinSCP';         PreChecked = $false }
+    @{ Category = 'Lab, Virtualization & Network Operations'; Name = 'PuTTY';             WingetId = 'PuTTY.PuTTY';           PreChecked = $false }
+
+    @{ Category = 'Hardware Diagnostics & System Monitoring'; Name = 'HWiNFO';            WingetId = 'REALiX.HWiNFO';                   PreChecked = $false }
+    @{ Category = 'Hardware Diagnostics & System Monitoring'; Name = 'CrystalDiskInfo';   WingetId = 'CrystalDewWorld.CrystalDiskInfo';  PreChecked = $false }
+    @{ Category = 'Hardware Diagnostics & System Monitoring'; Name = 'CPU-Z';             WingetId = 'CPUID.CPU-Z';                     PreChecked = $false }
+    @{ Category = 'Hardware Diagnostics & System Monitoring'; Name = 'FurMark';           WingetId = 'Geeks3D.FurMark.2';               PreChecked = $false }
+
+    @{ Category = 'Fabrication & Design (3D CAD & Slicers)';  Name = 'Bambu Studio';      WingetId = 'Bambulab.Bambustudio';  PreChecked = $false }
+    @{ Category = 'Fabrication & Design (3D CAD & Slicers)';  Name = 'OrcaSlicer';        WingetId = 'SoftFever.OrcaSlicer';  PreChecked = $false }
+    @{ Category = 'Fabrication & Design (3D CAD & Slicers)';  Name = 'FreeCAD';           WingetId = 'FreeCAD.FreeCAD';       PreChecked = $false }
+
+    @{ Category = 'Diverse Daily Productivity';               Name = 'VLC Media Player';  WingetId = 'VideoLAN.VLC';          PreChecked = $false }
+    @{ Category = 'Diverse Daily Productivity';               Name = 'ShareX';            WingetId = 'ShareX.ShareX';         PreChecked = $false }
+    @{ Category = 'Diverse Daily Productivity';               Name = 'Obsidian';          WingetId = 'Obsidian.Obsidian';     PreChecked = $false }
 )
 
 # ============================================================================================

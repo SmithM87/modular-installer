@@ -107,11 +107,18 @@ Released under the [MIT License](LICENSE).
 
 ## Default catalog
 
-| Category              | Apps                                                                       |
-| --------------------- | -------------------------------------------------------------------------- |
-| Runtimes & Frameworks | Visual C++ Runtimes All-In-One, .NET 8 Desktop Runtime                     |
-| System Utilities      | 7-Zip, Notepad++, Microsoft PowerToys                                      |
-| Dev & Engineering     | Git, VS Code, Windows Terminal, Sysinternals Suite                         |
+| Category                                  | Apps                                                                |
+| ----------------------------------------- | ------------------------------------------------------------------- |
+| Runtimes & Frameworks                     | Visual C++ Runtimes All-In-One, .NET 8 Desktop Runtime              |
+| System Utilities                          | 7-Zip, Notepad++, Microsoft PowerToys                               |
+| Dev & Engineering                         | Git, VS Code, Windows Terminal, Sysinternals Suite                  |
+| Lab, Virtualization & Network Operations  | Oracle VirtualBox, Vagrant, Nmap, WinSCP, PuTTY                     |
+| Hardware Diagnostics & System Monitoring  | HWiNFO, CrystalDiskInfo, CPU-Z, FurMark                             |
+| Fabrication & Design (3D CAD & Slicers)   | Bambu Studio, OrcaSlicer, FreeCAD                                   |
+| Diverse Daily Productivity                | VLC Media Player, ShareX, Obsidian                                  |
+
+Everything in the last four categories starts unchecked; the `PreChecked` flags in `$Apps` control the rest.
+Winget ids are matched case-sensitively (`--exact`), so spell them exactly as `winget search` prints them.
 
 Edit the `$Apps` table to change it. If an install fails with a hash mismatch, the publisher replaced the file
 after the winget manifest was written (this happens with unversioned download URLs, such as Sysinternals Suite
