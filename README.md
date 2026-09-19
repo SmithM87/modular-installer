@@ -101,6 +101,18 @@ command line.
 - **Cancel** skips the remaining apps after the current one finishes; it never kills an installer
   mid-way. Closing the window during an install asks first, then stops the running installer.
 
-## Test apps
+## License
 
-The catalog ships with four harmless examples: 7-Zip, Notepad++, Git and Windows Terminal.
+Released under the [MIT License](LICENSE).
+
+## Default catalog
+
+| Category              | Apps                                                                       |
+| --------------------- | -------------------------------------------------------------------------- |
+| Runtimes & Frameworks | Visual C++ Runtimes All-In-One, .NET 8 Desktop Runtime                     |
+| System Utilities      | 7-Zip, Notepad++, Microsoft PowerToys                                      |
+| Dev & Engineering     | Git, VS Code, Windows Terminal, Sysinternals Suite                         |
+
+Edit the `$Apps` table to change it. If an install fails with a hash mismatch, the publisher replaced the file
+after the winget manifest was written (this happens with unversioned download URLs, such as Sysinternals Suite
+right after a release). winget blocks it on purpose; try again once the manifest is updated.
