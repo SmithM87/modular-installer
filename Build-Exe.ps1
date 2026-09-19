@@ -38,6 +38,17 @@ foreach ($f in $scriptFile, $launcherFile, $manifestFile) {
     if (-not (Test-Path -LiteralPath $f)) { throw "Missing required file: $f" }
 }
 
+# --- Refuse to embed a broken script: an exe with a syntax error only fails after it has been shipped -------
+$parseErrors = $null
+[void][System.Management.Automation.Language.Parser]::ParseFile($scriptFile, [ref]$null, [ref]$parseErrors)
+if ($parseErrors.Count -gt 0) {
+    $detail = ($parseErrors | ForEach-Object { "  line $($_.Extent.StartLineNumber): $($_.Message)" }) -join "`n"
+    throw "Install-Software.ps1 has $($parseErrors.Count) syntax error(s); nothing was built.`n$detail"
+}
+# Windows PowerShell 5.1 reads a BOM-less .ps1 as ANSI, so any non-ASCII character would corrupt the plain-script path.
+$nonAscii = [regex]::Matches([System.IO.File]::ReadAllText($scriptFile), '[^\x00-\x7F]')
+if ($nonAscii.Count -gt 0) { throw "Install-Software.ps1 contains $($nonAscii.Count) non-ASCII character(s); keep it pure ASCII (use [char] code points)." }
+
 # --- Locate the compiler and the PowerShell engine assembly ----------------------------------
 $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework64\v4.0.30319\csc.exe'
 if (-not (Test-Path $csc)) { $csc = Join-Path $env:WINDIR 'Microsoft.NET\Framework\v4.0.30319\csc.exe' }
@@ -103,7 +114,7 @@ try {
     if ($outDir -and -not (Test-Path $outDir)) { New-Item -ItemType Directory -Path $outDir -Force | Out-Null }
 
     $cscArgs = @(
-        '/nologo', '/target:winexe', '/platform:anycpu', '/optimize+',
+        '/nologo', '/target:winexe', '/platform:anycpu', '/optimize+', '/warnaserror+',
         "/out:$OutFile",
         "/reference:$sma",
         "/win32manifest:$manifest",
@@ -116,6 +127,11 @@ try {
 
     $item = Get-Item -LiteralPath $OutFile
     Write-Host ("Built {0} ({1:N0} KB){2}" -f $item.FullName, ($item.Length / 1KB), $(if ($NoElevate) { ' [no-elevate test build]' } else { '' }))
+
+    # Publish a SHA-256 next to the exe so a copy can be checked later (Get-FileHash <exe> -Algorithm SHA256).
+    $hash = (Get-FileHash -LiteralPath $OutFile -Algorithm SHA256).Hash
+    [System.IO.File]::WriteAllText("$OutFile.sha256", "$hash  $($item.Name)`n", (New-Object System.Text.UTF8Encoding $false))
+    Write-Host "SHA-256: $hash"
 }
 finally {
     Remove-Item -LiteralPath $work -Recurse -Force -ErrorAction SilentlyContinue

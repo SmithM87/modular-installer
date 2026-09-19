@@ -103,6 +103,68 @@ if ((-not $isAdmin -and -not $DryRun) -or -not $isSta) {
 }
 
 # ============================================================================================
+#  2b. STARTUP CHECKS: single instance, catalog validation
+# ============================================================================================
+# Only one installer may run at a time: two would fight over winget's / Windows Installer's single-install
+# lock. A dry run uses its own per-session name so it can never collide with a real (elevated) instance.
+$mutexName  = if ($DryRun) { 'Local\ModularInstaller.DryRun' } else { 'Global\ModularInstaller.Main' }
+$mutexOwned    = $false
+$InstanceMutex = $null
+try {
+    # Create it unowned, then try to take it without waiting. (Passing initiallyOwned=$true would only grant
+    # ownership to whoever creates the object, so any process still holding a handle would wrongly block us.)
+    $InstanceMutex = [System.Threading.Mutex]::new($false, $mutexName)
+    try   { $mutexOwned = $InstanceMutex.WaitOne(0) }
+    catch [System.Threading.AbandonedMutexException] { $mutexOwned = $true }   # the previous owner was killed; it is ours now
+}
+catch { $mutexOwned = $false }       # e.g. access denied on a mutex owned by a higher-integrity process
+if (-not $mutexOwned) {
+    if ($InstanceMutex) { $InstanceMutex.Dispose() }         # don't keep the name alive while the dialog is open
+    [void][System.Windows.MessageBox]::Show('Software Installer is already running.', 'Software Installer', 'OK', 'Information')
+    exit 0
+}
+
+# winget package ids: letters, digits and . _ + - only, and never a leading "-" (which would read as an option).
+$WingetIdPattern = '^[A-Za-z0-9][A-Za-z0-9._+\-]*$'
+
+# Reject a malformed $Apps table up front with a readable message, instead of failing halfway through a run.
+function Test-AppCatalog($Catalog) {
+    $problems = New-Object System.Collections.Generic.List[string]
+    $seenIds  = @{}
+    $n = 0
+    foreach ($entry in @($Catalog)) {
+        $n++
+        if ($entry -isnot [System.Collections.IDictionary]) { $problems.Add("Entry $n is not a hashtable."); continue }
+        $label = "Entry $n" + $(if ($entry['Name'] -is [string] -and $entry['Name']) { " ($($entry['Name']))" } else { '' })
+
+        foreach ($key in 'Category', 'Name', 'WingetId') {
+            $value = $entry[$key]
+            if ($value -isnot [string] -or [string]::IsNullOrWhiteSpace($value)) { $problems.Add("${label}: '$key' must be a non-empty string.") }
+            elseif ($value -match '[\x00-\x1F]')                                 { $problems.Add("${label}: '$key' contains control characters.") }
+            elseif ($value.Length -gt 80)                                        { $problems.Add("${label}: '$key' is longer than 80 characters.") }
+        }
+        if ($entry.Contains('PreChecked') -and $entry['PreChecked'] -isnot [bool]) {
+            $problems.Add("${label}: 'PreChecked' must be `$true or `$false.")
+        }
+        $id = $entry['WingetId']
+        if ($id -is [string] -and $id) {
+            if ($id -notmatch $WingetIdPattern)     { $problems.Add("${label}: WingetId '$id' has characters winget ids never contain.") }
+            elseif ($seenIds.ContainsKey($id.ToLower())) { $problems.Add("${label}: WingetId '$id' is listed twice.") }
+            else                                    { $seenIds[$id.ToLower()] = $true }
+        }
+    }
+    $problems.ToArray()
+}
+
+$catalogProblems = @(Test-AppCatalog $Apps)
+if ($catalogProblems.Count -gt 0) {
+    [void][System.Windows.MessageBox]::Show(
+        ("The app catalog (`$Apps at the top of the script) has problems:`n`n" + ($catalogProblems -join "`n")),
+        'Software Installer', 'OK', 'Error')
+    exit 1
+}
+
+# ============================================================================================
 #  3. BACKGROUND WORKER  -  runs inside its own Runspace, never touches the UI
 # ============================================================================================
 # Kept as a scriptblock so the parser checks it, then passed to the runspace as text.
@@ -112,7 +174,10 @@ if ((-not $isAdmin -and -not $DryRun) -or -not $isSta) {
 $Worker = {
     param($Jobs, $State, $Queue)
 
+    $MaxLineLength = 2000        # a runaway line must not bloat the log or the queue
+
     function Send-Log([string]$Text, [string]$Level = 'info') {
+        if ($Text.Length -gt $MaxLineLength) { $Text = $Text.Substring(0, $MaxLineLength) + ' ...(line truncated)' }
         $Queue.Enqueue([pscustomobject]@{ Text = $Text; Level = $Level })
     }
     function Get-Stamp { (Get-Date).ToString('HH:mm:ss') }
@@ -141,8 +206,8 @@ $Worker = {
             Send-Log '' 'info'
             Send-Log ("[{0}] ({1}/{2}) {3} {4}" -f (Get-Stamp), $index, $total, $job.Action, $job.Name) 'head'
 
-            # A job without a command was rejected while it was being built (see New-InstallJob).
-            if (-not $job.Command) {
+            # A job without a program was rejected while it was being built (see the New-*Job functions).
+            if (-not $job.FileName) {
                 Send-Log $job.Error 'err'
                 $State.Failed++; $State.Completed++
                 continue
@@ -150,26 +215,42 @@ $Worker = {
             Send-Log "> $($job.Display)" 'cmd'
 
             $exit = $null
+            $proc = $null
             try {
-                # cmd.exe merges winget's stderr into stdout ("2>&1") so both streams arrive in order
-                # on a single pipe that we can read line by line.
+                # The program is started directly (no cmd.exe, no shell parsing). stdout and stderr are read
+                # concurrently, each line as it arrives, so nothing waits behind the other stream.
                 $psi = New-Object System.Diagnostics.ProcessStartInfo
-                $psi.FileName               = $env:ComSpec
-                $psi.Arguments              = "/d /c $($job.Command) 2>&1"
+                $psi.FileName               = $job.FileName
+                $psi.Arguments              = $job.Arguments
                 $psi.UseShellExecute        = $false
                 $psi.CreateNoWindow         = $true
                 $psi.RedirectStandardOutput = $true
-                $psi.RedirectStandardInput  = $true      # closed right away so winget can never wait on a prompt
+                $psi.RedirectStandardError  = $true
+                $psi.RedirectStandardInput  = $true      # closed right away so the program can never wait on a prompt
                 $psi.StandardOutputEncoding = [System.Text.Encoding]::UTF8
+                $psi.StandardErrorEncoding  = [System.Text.Encoding]::UTF8
 
                 $proc = New-Object System.Diagnostics.Process
                 $proc.StartInfo = $psi
                 [void]$proc.Start()
-                $State.Process = $proc                   # lets the UI kill it if the window is closed mid-install
+                $State.Process = $proc                   # lets the UI stop it (force-stop, window close)
                 $proc.StandardInput.Close()
 
+                $streams = @(
+                    @{ Reader = $proc.StandardOutput; Task = $proc.StandardOutput.ReadLineAsync() },
+                    @{ Reader = $proc.StandardError;  Task = $proc.StandardError.ReadLineAsync()  }
+                )
                 $last = $null
-                while ($null -ne ($line = $proc.StandardOutput.ReadLine())) {
+                while ($streams.Count -gt 0) {
+                    $ready = [System.Threading.Tasks.Task]::WaitAny([System.Threading.Tasks.Task[]]@($streams | ForEach-Object { $_.Task }))
+                    $stream = $streams[$ready]
+                    $line   = $stream.Task.Result
+                    if ($null -eq $line) {               # this stream reached end-of-file
+                        $streams = @($streams | Where-Object { $_ -ne $stream })
+                        continue
+                    }
+                    $stream.Task = $stream.Reader.ReadLineAsync()
+
                     if ($noise.IsMatch($line)) { continue }
                     $text = $line.TrimEnd()
                     if ($text -eq $last) { continue }    # collapse repeated status lines
@@ -184,11 +265,17 @@ $Worker = {
 
                 $proc.WaitForExit()
                 $exit = $proc.ExitCode
-                $State.Process = $null
-                $proc.Dispose()
             }
             catch {
                 Send-Log "Could not run installer: $($_.Exception.Message)" 'err'
+            }
+            finally {
+                # Never leave the program running if this loop is abandoned by an error.
+                $State.Process = $null
+                if ($proc) {
+                    try { if (-not $proc.HasExited) { $proc.Kill() } } catch { }
+                    $proc.Dispose()
+                }
             }
 
             # winget exit codes: https://github.com/microsoft/winget-cli/blob/master/doc/windows/package-manager/winget/returnCodes.md
@@ -198,7 +285,14 @@ $Worker = {
                 -1978335135  { Send-Log "[$stamp] OK: $($job.Name) - already installed."                     'ok';   $State.Succeeded++ }
                 -1978335189  { Send-Log "[$stamp] OK: $($job.Name) - no applicable updates."                 'ok';   $State.Succeeded++ }
                 3010         { Send-Log "[$stamp] OK: $($job.Name) $($job.Past). A restart is required."     'warn'; $State.Succeeded++ }
-                default      { Send-Log "[$stamp] FAILED: $($job.Name) (exit code $exit)."                    'err';  $State.Failed++ }
+                -1978335215  {
+                    Send-Log "[$stamp] FAILED: $($job.Name) (exit code $exit, installer hash mismatch)."      'err';  $State.Failed++
+                    Send-Log 'winget blocked this on purpose: the downloaded file no longer matches the checksum in the package manifest (the publisher replaced the file). Try again after the manifest is updated.' 'warn'
+                }
+                default      {
+                    $why = if ($null -eq $exit) { 'the program did not run' } else { "exit code $exit" }
+                    Send-Log "[$stamp] FAILED: $($job.Name) ($why)."                                          'err';  $State.Failed++
+                }
             }
             $State.Completed++
         }
@@ -217,85 +311,141 @@ $Worker = {
 #  3b. JOB DEFINITIONS  -  what the worker can run
 # ============================================================================================
 # A job is a plain object: Name/Action/Past build the log wording ("Updating <Name>" ... "<Name> <Past>"),
-# Display is the command shown in the log, Command is the cmd.exe command line the worker executes, and
-# Command is $null (with Error set) when the job was rejected. In -DryRun mode Command is a harmless fake.
-$FakeDelay = 'ping -n 2 127.0.0.1 >nul'      # cmd has no sleep; a 2-ping run is a portable ~1 second pause
+# Display is the command shown in the log, and FileName + Arguments are what the worker starts. Programs are
+# always given by full path (never looked up on PATH at run time). FileName stays empty, with Error set, when
+# a job was rejected. In -DryRun mode the program is a harmless cmd.exe fake.
+$SystemDir  = [Environment]::SystemDirectory                 # C:\Windows\System32
+$FakeDelay  = 'ping -n 2 127.0.0.1 >nul'                     # cmd has no sleep; a 2-ping run is a ~1 second pause
+$script:WingetPath = $null
 
-function New-Job([string]$Name, [string]$Action, [string]$Past, [string]$Display, [string]$Command, [bool]$NeedsWinget) {
+function New-Job([string]$Name, [string]$Action, [string]$Past, [string]$Display, [bool]$NeedsWinget) {
     [pscustomobject]@{ Name = $Name; Action = $Action; Past = $Past; Display = $Display
-                       Command = $Command; Error = $null; NeedsWinget = $NeedsWinget }
+                       FileName = ''; Arguments = ''; Error = $null; NeedsWinget = $NeedsWinget }
+}
+
+# winget is an app-execution alias, so it can't be signature-checked; use the fixed per-user alias location
+# and only fall back to a PATH lookup if it is missing. The result is resolved once, then reused.
+function Get-WingetPath {
+    if (-not $script:WingetPath) {
+        $alias = Join-Path $env:LOCALAPPDATA 'Microsoft\WindowsApps\winget.exe'
+        if (Test-Path -LiteralPath $alias) { $script:WingetPath = $alias }
+        else {
+            $found = Get-Command winget.exe -CommandType Application -ErrorAction SilentlyContinue | Select-Object -First 1
+            if ($found) { $script:WingetPath = $found.Source }
+        }
+    }
+    $script:WingetPath
+}
+
+# Point a job at winget (real mode) or at a fake (dry run).
+function Set-WingetCommand($Job, [string]$WingetArgs, [string]$FakeCommandLine) {
+    if ($DryRun) {
+        $Job.FileName  = Join-Path $SystemDir 'cmd.exe'
+        $Job.Arguments = "/d /c $FakeCommandLine"
+        return
+    }
+    $path = Get-WingetPath
+    if ($path) { $Job.FileName = $path; $Job.Arguments = $WingetArgs }
+    else       { $Job.Error = 'winget was not found. Install "App Installer" from the Microsoft Store and try again.' }
 }
 
 # Install one catalog app: winget install --exact --id <Id> ...
 function New-InstallJob($App) {
     $wingetArgs = "install --exact --id $($App.Id) --silent --accept-package-agreements --accept-source-agreements"
-    $job = New-Job $App.Name 'Installing' 'installed' "winget $wingetArgs" $null $true
+    $job = New-Job $App.Name 'Installing' 'installed' "winget $wingetArgs" $true
 
-    # The id ends up on a command line, so accept only characters valid in winget ids.
-    if ($App.Id -notmatch '^[A-Za-z0-9][A-Za-z0-9._+\-]*$') {
+    # The id is part of the argument string, so accept only characters valid in winget ids.
+    if ($App.Id -notmatch $WingetIdPattern) {
         $job.Error = "Invalid winget id '$($App.Id)'. Skipping."
         return $job
     }
 
-    if ($DryRun) {
-        # Fake winget: a few lines with a spinner and delays. Ids ending in ".Fail" simulate an error.
-        $fake = "echo Found $($App.Name) [$($App.Id)] Version 1.0.0 & $FakeDelay" +
-                " & echo Downloading https://example.invalid/$($App.Id) & echo   - & $FakeDelay & echo   \" +
-                " & echo Successfully verified installer hash & echo Starting package install... & $FakeDelay"
-        if ($App.Id -like '*.Fail') { $fake += ' & echo Simulated failure & exit /b 1' }
-        else                        { $fake += ' & echo Successfully installed' }
-        $job.Command = $fake
-    }
-    else {
-        $job.Command = "winget $wingetArgs"
-    }
+    # Fake winget: a few lines with a spinner, a stderr line and delays. Ids ending in ".Fail" simulate an error.
+    # The display name is reduced to safe characters because the fake goes through cmd.exe.
+    $safeName = $App.Name -replace '[^A-Za-z0-9 .+\-]', '_'
+    $fake = "echo Found $safeName [$($App.Id)] Version 1.0.0 & $FakeDelay" +
+            " & echo Downloading https://example.invalid/$($App.Id) & echo   - & $FakeDelay & echo   \" +
+            " & echo Note: simulated stderr line 1>&2 & echo Successfully verified installer hash" +
+            " & echo Starting package install... & $FakeDelay"
+    if ($App.Id -like '*.Fail') { $fake += ' & echo Simulated failure & exit /b 1' }
+    else                        { $fake += ' & echo Successfully installed' }
+
+    Set-WingetCommand $job $wingetArgs $fake
     $job
 }
 
 # Upgrade every installed package winget knows about (including ones with an unknown version).
 function New-WingetUpgradeJob {
     $wingetArgs = 'upgrade --all --include-unknown --silent --accept-package-agreements --accept-source-agreements'
-    $job = New-Job 'installed applications' 'Updating' 'updated' "winget $wingetArgs" $null $true
+    $job = New-Job 'installed applications' 'Updating' 'updated' "winget $wingetArgs" $true
 
-    if ($DryRun) {
-        $job.Command = "echo Name Id Version Available & echo Fake App Fake.App 1.0 2.0 & $FakeDelay" +
-                       " & echo Found Fake App [Fake.App] Version 2.0 & echo Downloading https://example.invalid/Fake.App & $FakeDelay" +
-                       " & echo Successfully installed & echo 1 package updated"
-    }
-    else {
-        $job.Command = "winget $wingetArgs"
-    }
+    $fake = "echo Name Id Version Available & echo Fake App Fake.App 1.0 2.0 & $FakeDelay" +
+            " & echo Found Fake App [Fake.App] Version 2.0 & echo Downloading https://example.invalid/Fake.App & $FakeDelay" +
+            " & echo Successfully installed & echo 1 package updated"
+
+    Set-WingetCommand $job $wingetArgs $fake
     $job
 }
 
-# Windows Update + driver patches through the PSWindowsUpdate module. The module is fetched from the
-# PowerShell Gallery on first use. Restarts are never forced: the job only reports that one is pending.
+# Windows Update + driver patches through the PSWindowsUpdate module. Restarts are never forced: the job only
+# reports that one is pending.
 function New-WindowsUpdateJob {
     $job = New-Job 'Windows Update' 'Running' 'finished' `
-        'powershell Get-WindowsUpdate -MicrosoftUpdate -Install -AcceptAll -IgnoreReboot   (PSWindowsUpdate module)' $null $false
+        'powershell Get-WindowsUpdate -MicrosoftUpdate -Install -AcceptAll -IgnoreReboot   (PSWindowsUpdate module)' $false
 
     if ($DryRun) {
-        $job.Command = "echo [+] Checking for Windows and driver updates & $FakeDelay" +
-                       " & echo   Downloaded  KB5000001  120 MB  Fake Cumulative Update & $FakeDelay" +
-                       " & echo   Installed   KB5000001  120 MB  Fake Cumulative Update & $FakeDelay" +
-                       " & echo WARNING: A restart is required to finish some updates. Reboot when convenient."
+        $job.FileName  = Join-Path $SystemDir 'cmd.exe'
+        $job.Arguments = "/d /c echo [+] Checking for Windows and driver updates & $FakeDelay" +
+                         " & echo   Downloaded  KB5000001  120 MB  Fake Cumulative Update & $FakeDelay" +
+                         " & echo   Installed   KB5000001  120 MB  Fake Cumulative Update & $FakeDelay" +
+                         " & echo WARNING: A restart is required to finish some updates. Reboot when convenient."
         return $job
     }
 
-    # Runs in a child Windows PowerShell 5.1 (PSWindowsUpdate targets it). Passed as -EncodedCommand so no
-    # quoting survives cmd.exe, and with $ProgressPreference silenced so no progress records pollute the pipe.
+    # Runs in a child Windows PowerShell 5.1 (PSWindowsUpdate targets it), passed as -EncodedCommand so no quoting
+    # can go wrong, with $ProgressPreference silenced so no progress records pollute the pipe.
+    #
+    # Supply-chain guard: the child runs elevated, so it only loads module code that an unprivileged process
+    # can't have tampered with. The module must live under Program Files (admin-writable only), it is installed
+    # there for all users if missing, and every code file must carry a valid signature from the module author.
+    # The marker line below splits the helper functions from the main logic (the build/tests rely on it).
     $child = @'
 $ErrorActionPreference = 'Stop'
 $ProgressPreference    = 'SilentlyContinue'
 [Console]::OutputEncoding = [System.Text.Encoding]::UTF8
+
+function Get-TrustedModule([string]$Root = $env:ProgramFiles) {
+    Get-Module -ListAvailable -Name PSWindowsUpdate |
+        Where-Object { $_.ModuleBase.StartsWith($Root + '\', [System.StringComparison]::OrdinalIgnoreCase) } |
+        Sort-Object Version -Descending | Select-Object -First 1
+}
+
+# Returns one entry per code file that is unsigned, tampered with, or signed by someone other than the author.
+function Test-ModuleSignatures([string]$Base, [string]$Signer = 'Michal Gajda') {
+    @(Get-ChildItem -LiteralPath $Base -Recurse -File |
+        Where-Object { $_.Extension -in '.psd1', '.psm1', '.ps1', '.ps1xml', '.dll', '.exe' } |
+        ForEach-Object {
+            $sig = Get-AuthenticodeSignature -LiteralPath $_.FullName
+            if ($sig.Status -ne 'Valid' -or $sig.SignerCertificate.Subject -notlike "*$Signer*") { '{0} ({1})' -f $_.Name, $sig.Status }
+        })
+}
+# ---- main ----
 try {
     [Net.ServicePointManager]::SecurityProtocol = [Net.ServicePointManager]::SecurityProtocol -bor [Net.SecurityProtocolType]::Tls12
-    if (-not (Get-Module -ListAvailable -Name PSWindowsUpdate)) {
-        Write-Host '[+] Installing PSWindowsUpdate module from the PowerShell Gallery...'
+    $module = Get-TrustedModule
+    if (-not $module) {
+        Write-Host '[+] Installing PSWindowsUpdate for all users (Program Files) from the PowerShell Gallery...'
         Install-PackageProvider -Name NuGet -MinimumVersion 2.8.5.201 -Force | Out-Null
-        Install-Module PSWindowsUpdate -Force -Confirm:$false -Scope CurrentUser
+        Install-Module PSWindowsUpdate -Force -Confirm:$false -Scope AllUsers
+        $module = Get-TrustedModule
     }
-    Import-Module PSWindowsUpdate
+    if (-not $module) { throw 'PSWindowsUpdate was not found under Program Files.' }
+
+    $problems = Test-ModuleSignatures $module.ModuleBase
+    if ($problems.Count -gt 0) { throw ('PSWindowsUpdate failed the signature check and was NOT loaded: ' + ($problems -join ', ')) }
+    Write-Host ('[+] PSWindowsUpdate {0} verified (valid signature from the module author).' -f $module.Version)
+
+    Import-Module -Name (Join-Path $module.ModuleBase 'PSWindowsUpdate.psd1') -Force
     Write-Host '[+] Checking for Windows and driver updates (this can take several minutes)...'
     $count = 0
     Get-WindowsUpdate -MicrosoftUpdate -Install -AcceptAll -IgnoreReboot | ForEach-Object {
@@ -312,7 +462,8 @@ catch {
 }
 '@
     $encoded = [Convert]::ToBase64String([System.Text.Encoding]::Unicode.GetBytes($child))
-    $job.Command = "powershell.exe -NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand $encoded"
+    $job.FileName  = Join-Path $SystemDir 'WindowsPowerShell\v1.0\powershell.exe'
+    $job.Arguments = "-NoProfile -NonInteractive -ExecutionPolicy Bypass -OutputFormat Text -EncodedCommand $encoded"
     $job
 }
 
@@ -596,15 +747,18 @@ try {
 
     $Window.Title = 'Software Installer' + $(if ($isAdmin) { ' (Administrator)' } elseif ($DryRun) { ' (dry run)' } else { '' })
 
-    # Dark title bar on Windows 10 20H1+/11 (silently ignored where unsupported).
-    Add-Type -Namespace Win32 -Name Dwm -MemberDefinition '[DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);'
-    $Window.Add_SourceInitialized({
-        try {
-            $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper $Window).Handle
-            $dark = 1
-            [void][Win32.Dwm]::DwmSetWindowAttribute($hwnd, 20, [ref]$dark, 4)
-        } catch { }
-    })
+    # Dark title bar on Windows 10 20H1+/11. Purely cosmetic, so any failure here (older Windows, or security
+    # software blocking the runtime compile behind Add-Type) is ignored instead of stopping the app.
+    try {
+        Add-Type -Namespace Win32 -Name Dwm -ErrorAction Stop -MemberDefinition '[DllImport("dwmapi.dll")] public static extern int DwmSetWindowAttribute(IntPtr hwnd, int attr, ref int value, int size);'
+        $Window.Add_SourceInitialized({
+            try {
+                $hwnd = (New-Object System.Windows.Interop.WindowInteropHelper $Window).Handle
+                $dark = 1
+                [void][Win32.Dwm]::DwmSetWindowAttribute($hwnd, 20, [ref]$dark, 4)
+            } catch { }
+        })
+    } catch { }
 
     # ---- Log pane ------------------------------------------------------------------------
     $LogBrushes = @{}
@@ -630,17 +784,33 @@ try {
     # Thread-safe hand-off: the worker enqueues, the UI thread dequeues in batches.
     $Queue = New-Object 'System.Collections.Concurrent.ConcurrentQueue[object]'
 
+    # The UI thread must never fall behind a chatty program. Each tick therefore has a hard time budget, and if
+    # the backlog grows past $MaxBacklog the oldest waiting lines are dropped (with a note in the log).
+    $MaxBacklog  = 3000
+    $TickBudgetMs = 30
+
     function Sync-LogQueue {
         # Only auto-scroll if the user hasn't scrolled up to read something.
         $atBottom = ($LogBox.VerticalOffset + $LogBox.ViewportHeight) -ge ($LogBox.ExtentHeight - 24)
         $item = $null; $added = $false
-        while ($Queue.TryDequeue([ref]$item)) {
+
+        if ($Queue.Count -gt $MaxBacklog) {
+            $dropped = 0
+            $excess  = $Queue.Count - 1000
+            for ($i = 0; $i -lt $excess; $i++) { if ($Queue.TryDequeue([ref]$item)) { $dropped++ } }
+            Add-LogLine "[log] $dropped lines skipped to keep the window responsive." 'warn'
+            $added = $true
+        }
+
+        $budget = [System.Diagnostics.Stopwatch]::StartNew()
+        while ($budget.ElapsedMilliseconds -lt $TickBudgetMs -and $Queue.TryDequeue([ref]$item)) {
             Add-LogLine $item.Text $item.Level
             $added = $true
         }
+
         if ($added) {
             # Cap the document so very long sessions stay fast (inlines come in Run + LineBreak pairs).
-            if ($LogPara.Inlines.Count -gt 8000) {
+            while ($LogPara.Inlines.Count -gt 8000) {
                 1..1000 | ForEach-Object { [void]$LogPara.Inlines.Remove($LogPara.Inlines.FirstInline) }
             }
             if ($atBottom) { $LogBox.ScrollToEnd() }
@@ -719,14 +889,18 @@ try {
         foreach ($b in $BtnUpdateApps, $BtnUpdateWin, $BtnUpdateAll) { $b.IsEnabled = -not $IsRunning }
         $BtnCancel.Visibility   = if ($IsRunning) { 'Visible' } else { 'Collapsed' }
         $BtnCancel.IsEnabled    = $true
+        $BtnCancel.Content      = 'Cancel'
+        $BtnCancel.ToolTip      = 'Skip the remaining tasks after the current one finishes'
         Update-SelectionCount
     }
 
+    # Kills the running program and everything it spawned (/T). Uses the system taskkill by full path.
     function Stop-InstallerProcess {
         $p = $State.Process
         if ($p) {
-            # /T also kills winget and any installer it spawned.
-            try { Start-Process taskkill.exe -ArgumentList "/PID $($p.Id) /T /F" -WindowStyle Hidden -Wait } catch { }
+            try {
+                Start-Process -FilePath (Join-Path $SystemDir 'taskkill.exe') -ArgumentList "/PID $($p.Id) /T /F" -WindowStyle Hidden -Wait
+            } catch { }
         }
     }
 
@@ -735,8 +909,7 @@ try {
         $Jobs = @($Jobs)
         if ($Jobs.Count -eq 0) { return }
 
-        if (-not $DryRun -and @($Jobs | Where-Object { $_.NeedsWinget }).Count -gt 0 -and
-            -not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+        if (-not $DryRun -and @($Jobs | Where-Object { $_.NeedsWinget }).Count -gt 0 -and -not (Get-WingetPath)) {
             Add-LogLine 'winget was not found. Install "App Installer" from the Microsoft Store and try again.' 'err'
             return
         }
@@ -748,21 +921,30 @@ try {
         })
 
         # A dedicated runspace = a separate thread. The UI thread only starts it and polls it.
-        $script:Rs = [runspacefactory]::CreateRunspace()
-        $script:Rs.ApartmentState = 'MTA'
-        $script:Rs.ThreadOptions  = 'ReuseThread'
-        $script:Rs.Open()
+        try {
+            $script:Rs = [runspacefactory]::CreateRunspace()
+            $script:Rs.ApartmentState = 'MTA'
+            $script:Rs.ThreadOptions  = 'ReuseThread'
+            $script:Rs.Open()
 
-        $script:Ps = [powershell]::Create()
-        $script:Ps.Runspace = $script:Rs
-        [void]$script:Ps.AddScript($Worker.ToString()).
-            AddArgument($Jobs).AddArgument($script:State).AddArgument($Queue)
+            $script:Ps = [powershell]::Create()
+            $script:Ps.Runspace = $script:Rs
+            [void]$script:Ps.AddScript($Worker.ToString()).
+                AddArgument($Jobs).AddArgument($script:State).AddArgument($Queue)
 
-        $Progress.Maximum = $Jobs.Count
-        $Progress.Value   = 0
-        Set-UiRunning $true
-        $Timer.Start()
-        $script:Async = $script:Ps.BeginInvoke()      # returns immediately; the window stays responsive
+            $Progress.Maximum = $Jobs.Count
+            $Progress.Value   = 0
+            Set-UiRunning $true
+            $Timer.Start()
+            $script:Async = $script:Ps.BeginInvoke()      # returns immediately; the window stays responsive
+        }
+        catch {
+            # Don't leak a half-built runspace if starting failed.
+            $Timer.Stop()
+            if ($script:Ps) { $script:Ps.Dispose() }
+            if ($script:Rs) { $script:Rs.Dispose() }
+            throw
+        }
     }
 
     function Complete-Install {
@@ -779,11 +961,18 @@ try {
     $Timer = [System.Windows.Threading.DispatcherTimer]::new()
     $Timer.Interval = [TimeSpan]::FromMilliseconds(100)
     $Timer.Add_Tick({
-        $finished = $Async.IsCompleted          # read BEFORE draining so no trailing lines are lost
-        Sync-LogQueue
-        $Progress.Value  = $State.Completed
-        $StatusText.Text = $State.Current
-        if ($finished) { Complete-Install }
+        # An error in one tick must not leave the UI stuck in the "running" state.
+        try {
+            $finished = $Async.IsCompleted          # read BEFORE draining so no trailing lines are lost
+            Sync-LogQueue
+            $Progress.Value  = $State.Completed
+            $StatusText.Text = $State.Current
+            if ($finished) { Complete-Install }
+        }
+        catch {
+            Add-LogLine "Internal error while updating the log: $($_.Exception.Message)" 'err'
+            if ($Async -and $Async.IsCompleted) { $Timer.Stop(); Set-UiRunning $false }
+        }
     })
 
     # ---- Buttons -------------------------------------------------------------------------
@@ -801,7 +990,7 @@ try {
     function Confirm-WindowsUpdate {
         if ($DryRun) { return $true }
         $answer = [System.Windows.MessageBox]::Show($Window,
-            "This installs all available Windows and driver updates. If it is missing, the PSWindowsUpdate module is downloaded from the PowerShell Gallery first. A restart is never forced.`n`nContinue?",
+            "This installs all available Windows and driver updates. It uses the PSWindowsUpdate module: if it is not installed under Program Files, it is downloaded for all users from the PowerShell Gallery, and its digital signature is verified before anything is loaded. A restart is never forced.`n`nContinue?",
             'Windows Update', 'YesNo', 'Question')
         $answer -eq 'Yes'
     }
@@ -819,10 +1008,23 @@ try {
         catch { Add-LogLine "Could not start: $($_.Exception.Message)" 'err'; Set-UiRunning $false }
     })
 
+    # Two-step cancel: the first click skips the remaining tasks (the current one finishes normally); the button
+    # then becomes "Stop now", which force-stops a hung installer after a confirmation.
     $BtnCancel.Add_Click({
-        $State.Cancel = $true
-        $BtnCancel.IsEnabled = $false
-        Add-LogLine 'Cancel requested. The current task will finish; remaining tasks are skipped.' 'warn'
+        if (-not $State.Cancel) {
+            $State.Cancel = $true
+            $BtnCancel.Content = 'Stop now'
+            $BtnCancel.ToolTip = 'Force-stop the running installer (may leave software partly installed)'
+            Add-LogLine 'Cancel requested. The current task will finish; remaining tasks are skipped. Use "Stop now" to force-stop a hung installer.' 'warn'
+            return
+        }
+        $answer = [System.Windows.MessageBox]::Show($Window,
+            "Force-stop the running installer now?`n`nStopping an installer part-way can leave software partly installed.",
+            'Stop now', 'YesNo', 'Warning')
+        if ($answer -eq 'Yes') {
+            Add-LogLine 'Force-stopping the running installer...' 'warn'
+            Stop-InstallerProcess
+        }
     })
 
     $Window.Add_Closing({
@@ -842,7 +1044,7 @@ try {
     $mode = if ($DryRun) { 'DRY RUN - winget is simulated, nothing will be installed.' }
             else         { 'Running elevated. Select apps and click "Install Selected".' }
     Add-LogLine $mode 'info'
-    if (-not $DryRun -and -not (Get-Command winget.exe -ErrorAction SilentlyContinue)) {
+    if (-not $DryRun -and -not (Get-WingetPath)) {
         Add-LogLine 'Warning: winget.exe was not found on this system.' 'warn'
     }
 

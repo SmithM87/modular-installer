@@ -51,12 +51,13 @@ script uses the C# compiler (`csc.exe`) that ships with Windows.
 | **Windows Update** | Windows and driver updates through the [PSWindowsUpdate](https://www.powershellgallery.com/packages/PSWindowsUpdate) module: `Get-WindowsUpdate -MicrosoftUpdate -Install -AcceptAll -IgnoreReboot` |
 | **Run All Updates**| Update Apps, then Windows Update                                                              |
 
-- Windows Update asks for confirmation first. If PSWindowsUpdate isn't installed, it is downloaded from the
-  PowerShell Gallery (current user scope) on first use.
+- Windows Update asks for confirmation first. It uses the PSWindowsUpdate module: if a copy isn't installed under
+  `Program Files`, it is downloaded for all users from the PowerShell Gallery, and its digital signature is
+  verified before anything is loaded (see [Security](#security--reliability)).
 - A restart is never forced. If updates need one, the log says so; reboot when convenient.
 - These use the same background pipeline as installs, so the log streams live and the window stays responsive.
-- **Cancel** stops after the current task, so during a single long Windows Update it has no effect until that
-  task ends.
+- **Cancel** stops after the current task; during one long Windows Update, click it a second time (**Stop now**)
+  to force-stop the running task after a confirmation.
 
 ### Dry run
 
@@ -85,21 +86,50 @@ $Apps = @(
 | `WingetId`   | Exact winget package id (find it with `winget search <name>`)   |
 | `PreChecked` | `$true` to have the box ticked when the window opens            |
 
-Ids may only contain letters, digits, `.`, `_`, `+` and `-`; anything else is rejected before it can reach a
-command line.
+Ids may only contain letters, digits, `.`, `_`, `+` and `-`, and may not start with `-`; anything else is
+rejected. The whole table is validated when the program starts: a missing field, an empty or duplicate id or a
+non-boolean `PreChecked` shows a message listing every problem instead of starting.
 
 ## How it works
 
 - Every action (install, app upgrade, Windows Update) is a small *job* object; the worker runs a list of jobs
   on a separate **Runspace** so the window stays responsive.
-- The worker runs each job's command, e.g. `winget install --exact --id <Id> --silent --accept-package-agreements --accept-source-agreements`,
-  through `cmd /c ... 2>&1`, merging stdout and stderr, and reads it line by line.
+- The worker starts each job's program directly, e.g. `winget install --exact --id <Id> --silent --accept-package-agreements --accept-source-agreements`
+  (no `cmd.exe`, no shell parsing), and reads stdout and stderr concurrently, line by line.
 - Lines go onto a thread-safe queue. A `DispatcherTimer` on the UI thread drains the queue into the log,
   so the worker never touches the UI directly.
 - Spinner characters and block progress bars are filtered out of the log.
-- winget's "already installed" and "already up to date" exit codes count as success.
-- **Cancel** skips the remaining apps after the current one finishes; it never kills an installer
-  mid-way. Closing the window during an install asks first, then stops the running installer.
+- winget's "already installed" and "already up to date" exit codes count as success; a hash mismatch gets a
+  plain-language explanation.
+- **Cancel** skips the remaining tasks after the current one finishes and never kills an installer by itself.
+  A second click (**Stop now**) force-stops the running task after a confirmation. Closing the window during an
+  install asks first, then stops the running task and everything it started.
+
+## Security & reliability
+
+- **Elevated code paths:** programs are always started by full path (winget from its fixed per-user alias
+  location, `powershell.exe` and `taskkill.exe` from System32), never looked up on `PATH` at run time. There is
+  no `cmd.exe` in the real install path, and app names are never placed on a command line.
+- **Windows Update supply chain:** the elevated child only loads PSWindowsUpdate from `Program Files`
+  (writable by administrators only). Every code file must carry a valid Authenticode signature from the module
+  author; a tampered, unsigned or extra file makes the job stop with a clear error before anything is imported.
+- **Single instance:** a second copy refuses to start (two installers would fight over the Windows Installer lock).
+- **Responsive under load:** each timer tick has a 30 ms budget and the pending backlog is capped, so a program
+  that prints tens of thousands of lines cannot freeze the window (a 60,000-line flood was tested); very long
+  lines are truncated.
+- **Build:** `Build-Exe.ps1` refuses to embed a script with syntax errors or non-ASCII characters, treats compiler
+  warnings as errors, and writes a `.sha256` next to the exe.
+
+Known limits, stated plainly:
+
+- The exe is **unsigned** (no code-signing certificate), so SmartScreen may warn on the first run.
+- winget is an app-execution alias and cannot be signature-checked, so it is trusted by its fixed location only.
+- Running the plain `.ps1` from a folder that non-administrators can edit lets them change what an elevated run
+  executes; the built `.exe` embeds the script and avoids that.
+- stdout and stderr are separate pipes, so their relative order is best-effort (winget writes nearly everything
+  to stdout).
+- `winget upgrade --all --include-unknown` updates every package winget can identify, including ones whose
+  installed version is unknown, which can upgrade software you deliberately left alone.
 
 ## License
 
